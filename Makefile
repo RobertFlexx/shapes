@@ -1,14 +1,30 @@
 FC = gfortran
-FFLAGS ?= -O3 -march=native -ffast-math -funroll-loops -std=f2018
+FFLAGS ?= -O3 -std=f2018 -Wall -Wextra
+CFLAGS ?= -O2 -std=c99 -Wall -Wextra -Wpedantic
+CPPFLAGS ?=
+LDFLAGS ?=
+LDLIBS ?=
+EXEEXT ?=
+PYTHON ?= python3
 
-.PHONY: all clean run
-all: shapes
+.PHONY: all clean run check
+all: shapes$(EXEEXT)
 
-shapes: shapes.f90
-	$(FC) $(FFLAGS) $< -o $@
+shapes$(EXEEXT): shapes.o terminal.o
+	$(FC) $(LDFLAGS) shapes.o terminal.o $(LDLIBS) -o $@
 
-run: shapes
-	./shapes
+shapes.o: shapes.f90
+	$(FC) $(FFLAGS) -c shapes.f90 -o $@
+
+terminal.o: terminal.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c terminal.c -o $@
+
+run: shapes$(EXEEXT)
+	./shapes$(EXEEXT)
+
+check: shapes$(EXEEXT)
+	./shapes$(EXEEXT) --check-meshes
+	$(PYTHON) tests/test_shapes.py ./shapes$(EXEEXT)
 
 clean:
-	rm -f shapes *.o *.mod
+	rm -f shapes shapes.exe shapes.o terminal.o

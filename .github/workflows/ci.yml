@@ -1,0 +1,63 @@
+name: Portability
+
+on: [push, pull_request, workflow_dispatch]
+
+permissions:
+  contents: read
+
+jobs:
+  posix:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux compilers
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gfortran gcc make python3
+      - name: Install macOS compiler
+        if: runner.os == 'macOS'
+        run: brew install gcc
+      - name: Build and test with runtime checks
+        run: make check FFLAGS='-O1 -g -std=f2018 -Wall -Wextra -Werror -fcheck=all -ffpe-trap=invalid,zero,overflow' CFLAGS='-O2 -std=c99 -Wall -Wextra -Wpedantic -Werror'
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            make
+            mingw-w64-ucrt-x86_64-gcc-fortran
+            mingw-w64-ucrt-x86_64-python
+      - name: Build native Windows executable and run portable tests
+        shell: msys2 {0}
+        run: make check CC=gcc EXEEXT=.exe PYTHON=python FFLAGS='-O1 -g -std=f2018 -Wall -Wextra -Werror -fcheck=all -ffpe-trap=invalid,zero,overflow' CFLAGS='-O2 -std=c99 -Wall -Wextra -Wpedantic -Werror'
+
+  freebsd:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: vmactions/freebsd-vm@v1
+        with:
+          prepare: pkg install -y gcc14 gmake python3
+          run: gmake check FC=gfortran14 CC=cc FFLAGS='-O1 -g -std=f2018 -Wall -Wextra -Werror -fcheck=all -ffpe-trap=invalid,zero,overflow' CFLAGS='-O2 -std=c99 -Wall -Wextra -Wpedantic -Werror'
+
+  illumos:
+    name: illumos terminal API build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: vmactions/omnios-vm@v1
+        with:
+          release: r151054
+          usesh: true
+          prepare: pkg install build-essential
+          run: gcc -std=c99 -Wall -Wextra -Wpedantic -Werror -c terminal.c -o terminal.o

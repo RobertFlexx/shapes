@@ -1,62 +1,44 @@
-module shape_lab_runtime
-  use, intrinsic :: iso_c_binding, only: c_int, c_funptr
-  implicit none
-  integer(c_int), volatile, save :: stop_requested = 0_c_int
-contains
-  subroutine handle_signal(sig) bind(C)
-    integer(c_int), value :: sig
-    stop_requested = sig
-  end subroutine handle_signal
-end module shape_lab_runtime
-
 program fortran_shape_lab
-  use, intrinsic :: iso_fortran_env, only: real32, real64, int32, int64, output_unit
-  use, intrinsic :: iso_c_binding, only: c_int, c_short, c_long, c_ptr, c_loc, c_funptr, c_funloc, &
-                                           c_size_t, c_char
-  use shape_lab_runtime, only: stop_requested, handle_signal
+  use, intrinsic :: iso_fortran_env, only: real32, real64, int32, int64, output_unit, error_unit
+  use, intrinsic :: iso_c_binding, only: c_int, c_double, c_char
+  use, intrinsic :: ieee_arithmetic, only: ieee_is_finite
   implicit none
 
   interface
-    function c_ioctl(fd, request, argp) bind(C, name="ioctl") result(res)
-      import :: c_int, c_long, c_ptr
-      integer(c_int), value :: fd
-      integer(c_long), value :: request
-      type(c_ptr), value :: argp
-      integer(c_int) :: res
-    end function c_ioctl
-
-    subroutine c_usleep(usec) bind(C, name="usleep")
+    function terminal_open(color, unicode, mouse, plain, alternate) bind(C, name='sl_terminal_open') result(res)
       import :: c_int
-      integer(c_int), value :: usec
-    end subroutine c_usleep
-
-    function c_signal(sig, handler) bind(C, name="signal") result(previous)
-      import :: c_int, c_funptr
-      integer(c_int), value :: sig
-      type(c_funptr), value :: handler
-      type(c_funptr) :: previous
-    end function c_signal
-
-    function c_read(fd, buf, count) bind(C, name="read") result(res)
-      import :: c_int, c_ptr, c_size_t, c_long
-      integer(c_int), value :: fd
-      type(c_ptr), value :: buf
-      integer(c_size_t), value :: count
-      integer(c_long) :: res
-    end function c_read
+      integer(c_int), intent(inout) :: color, unicode, mouse
+      integer(c_int), value :: plain, alternate
+      integer(c_int) :: res
+    end function terminal_open
+    subroutine terminal_close() bind(C, name='sl_terminal_close')
+    end subroutine terminal_close
+    subroutine native_terminal_size(width, height, aspect) bind(C, name='sl_terminal_size')
+      import :: c_int, c_double
+      integer(c_int), intent(out) :: width, height
+      real(c_double), intent(out) :: aspect
+    end subroutine native_terminal_size
+    subroutine terminal_sleep(milliseconds) bind(C, name='sl_terminal_sleep')
+      import :: c_int
+      integer(c_int), value :: milliseconds
+    end subroutine terminal_sleep
+    function terminal_events() bind(C, name='sl_terminal_events') result(res)
+      import :: c_int
+      integer(c_int) :: res
+    end function terminal_events
+    function terminal_read(buffer, capacity) bind(C, name='sl_terminal_read') result(res)
+      import :: c_int, c_char
+      character(kind=c_char), intent(out) :: buffer(*)
+      integer(c_int), value :: capacity
+      integer(c_int) :: res
+    end function terminal_read
   end interface
-
-  type, bind(C) :: winsize
-    integer(c_short) :: ws_row
-    integer(c_short) :: ws_col
-    integer(c_short) :: ws_xpixel
-    integer(c_short) :: ws_ypixel
-  end type winsize
 
   type :: mesh_type
     character(len=20) :: name = 'Cube'
     integer :: nv = 0, nt = 0, ne = 0
     logical :: smooth = .false.
+    logical :: two_sided = .false.
     real(real32), allocatable :: v(:,:), n(:,:)
     integer, allocatable :: tri(:,:), edge(:,:)
   end type mesh_type
@@ -71,35 +53,47 @@ program fortran_shape_lab
     logical :: stars = .true., grid = .true.
   end type theme_type
 
-  integer, parameter :: target_fps = 30
-  integer, parameter :: resize_check_frames = 10
-  integer, parameter :: max_shape = 5
+  integer, parameter :: resize_check_frames = 5
+  integer, parameter :: max_shape = 20
   integer, parameter :: max_theme = 5
   integer, parameter :: cell_bytes = 64
-  integer(c_int), parameter :: SIGINT = 2_c_int
-  integer(c_int), parameter :: SIGTERM = 15_c_int
-  integer(c_long), parameter :: TIOCGWINSZ = int(z'5413', c_long)
-  real(real64), parameter :: target_frame_time = 1.0_real64 / real(target_fps, real64)
   real(real32), parameter :: PI = 3.1415927_real32
   character(len=1), parameter :: ESC = achar(27)
-  character(len=3), parameter :: UPPER_HALF = '▀'
+  character(len=3), parameter :: UPPER_HALF = char(226)//char(150)//char(128)
+  character(len=20), parameter :: shape_names(max_shape) = [character(len=20) :: &
+    'Cube', 'Icosahedron', 'Sphere', 'Torus', 'Tetrahedron', 'Octahedron', 'Dodecahedron', &
+    'Cylinder', 'Cone', 'Capsule', 'Triangular prism', 'Hexagonal prism', 'Pyramid', &
+    'Rounded cube', 'Torus knot', 'Mobius strip', 'Star', 'Crystal', 'Spring', 'Ellipsoid']
+  character(len=24), parameter :: theme_names(max_theme) = [character(len=24) :: &
+    'Neon Ice', 'Sunset Chrome', 'Emerald Lab', 'Studio Neutral', 'Vaporwave']
 
   type(mesh_type) :: mesh
   type(theme_type) :: theme
-  integer(int32), allocatable :: pixels(:,:), background(:,:), previous_pixels(:,:)
+  integer(int32), allocatable :: pixels(:,:), background(:,:)
   real(real32), allocatable :: zbuffer(:,:)
+  real(real32), allocatable :: world(:,:), world_normals(:,:), screen_x(:), screen_y(:), vertex_depth(:)
+  logical, allocatable :: projected(:)
+  integer, allocatable :: previous_fg(:,:), previous_bg(:,:)
+  character(len=1), allocatable :: previous_glyph(:,:)
   character(len=:), allocatable :: frame_text
   character(len=3), save :: decimal3(0:255)
-  character(kind=c_char), target :: input_bytes(1024)
+  character(kind=c_char) :: input_bytes(1024)
 
   integer :: cols, rows, ph, new_cols, new_rows
   integer :: frame_number, used_bytes, shape_id, theme_id
+  integer :: stop_requested = 0, frame_limit = 0, target_fps = 30, detail = 20
+  integer :: requested_cols = 0, requested_rows = 0, view_top, view_height, hud_top, hud_bottom
+  integer(c_int) :: color_mode = -1, unicode_mode = -1, mouse_mode = -1, event_flags, terminal_mode
+  integer(c_int) :: plain_mode = 0, alternate_mode = 1
+  real(real32) :: cell_aspect = 0.5_real32, requested_aspect = 0.0_real32, pixel_aspect, projection_scale
+  real(real32) :: input_age = 0.0_real32
+  logical :: interactive, draw_edges = .true., check_meshes = .false.
+  logical :: initial_spin = .true., initial_hud = .true.
   integer(int64) :: clock_rate, frame_start, frame_end, previous_start
-  real(real64) :: dt, elapsed, sleep_time, t
+  real(real64) :: dt, elapsed, sleep_time, t, target_frame_time
   real(real32) :: orientation(3,3), angular_velocity(3), drag_vector(3)
   real(real32) :: camera_distance, auto_speed, interaction_quiet, inertia_speed
   logical :: auto_rotate, show_hud, force_redraw
-  type(c_funptr) :: previous_handler
 
   integer :: input_state, mouse_len
   character(len=64) :: mouse_text
@@ -109,11 +103,13 @@ program fortran_shape_lab
   call init_decimal_table()
   shape_id = 1
   theme_id = 1
-  call load_shape(shape_id, mesh)
+  call parse_options()
+  if (check_meshes) then
+    call validate_meshes()
+    stop
+  end if
+  target_frame_time = 1.0_real64 / real(target_fps, real64)
   call load_theme(theme_id, theme)
-
-  previous_handler = c_signal(SIGINT, c_funloc(handle_signal))
-  previous_handler = c_signal(SIGTERM, c_funloc(handle_signal))
 
   call rotation_matrix(-0.34_real32, 0.62_real32, 0.08_real32, orientation)
   camera_distance = 5.0_real32
@@ -121,8 +117,8 @@ program fortran_shape_lab
   drag_vector = [0.0_real32,0.0_real32,-1.0_real32]
   auto_speed = 1.0_real32
   interaction_quiet = 0.0_real32
-  auto_rotate = .true.
-  show_hud = .true.
+  auto_rotate = initial_spin
+  show_hud = initial_hud
   force_redraw = .true.
   dragging = .false.
   mouse_present = .false.
@@ -135,18 +131,24 @@ program fortran_shape_lab
   t = 0.0_real64
   frame_number = 0
 
+  terminal_mode = terminal_open(color_mode, unicode_mode, mouse_mode, plain_mode, alternate_mode)
+  interactive = terminal_mode == 1
+  if (.not.interactive) then
+    color_mode = 0; unicode_mode = 0; mouse_mode = 0; frame_limit = 1
+  end if
   call terminal_size(cols, rows)
   call ensure_buffers(cols, rows)
-
-  call execute_command_line('stty -echo -icanon min 0 time 0', wait=.true.)
-  write(output_unit,'(A)',advance='no') ESC//'[?1049h'//ESC//'[?25l'//ESC//'[?7l'// &
-       ESC//'[?1003h'//ESC//'[?1006h'//ESC//'[2J'
-  flush(output_unit)
+  call load_shape(shape_id, mesh)
 
   call system_clock(previous_start, clock_rate)
 
-  do while (stop_requested == 0_c_int)
+  do while (stop_requested == 0)
     call system_clock(frame_start)
+    event_flags = terminal_events()
+    if (iand(event_flags,1_c_int)/=0) exit
+    if (iand(event_flags,2_c_int)/=0) then
+      force_redraw=.true.; dragging=.false.; mouse_present=.false.; input_state=0
+    end if
 
     if (frame_number > 0) then
       dt = real(frame_start - previous_start, real64) / real(clock_rate, real64)
@@ -156,22 +158,25 @@ program fortran_shape_lab
     end if
     previous_start = frame_start
 
-    if (mod(frame_number, resize_check_frames) == 0) then
+    if (mod(frame_number, resize_check_frames) == 0 .or. force_redraw) then
       call terminal_size(new_cols, new_rows)
       if (new_cols /= cols .or. new_rows /= rows) then
         cols = new_cols
         rows = new_rows
         call ensure_buffers(cols, rows)
+        call load_shape(shape_id,mesh)
         force_redraw = .true.
-        write(output_unit,'(A)',advance='no') ESC//'[2J'
+        dragging=.false.; mouse_present=.false.
+        if(interactive)write(output_unit,'(A)',advance='no') ESC//'[2J'
       end if
     end if
 
-    call poll_input(real(dt,real32))
-    if (stop_requested /= 0_c_int) exit
+    if(interactive)call poll_input(real(dt,real32))
+    if (stop_requested /= 0) exit
+    call update_layout()
 
     ph = rows * 2
-    t = t + dt
+    if(auto_rotate .and. interactive)t = t + dt
     interaction_quiet = max(0.0_real32, interaction_quiet - real(dt,real32))
 
     if (.not. dragging) then
@@ -181,7 +186,7 @@ program fortran_shape_lab
       angular_velocity = angular_velocity * exp(-3.35_real32 * real(dt,real32))
     end if
 
-    if (auto_rotate .and. .not. dragging .and. interaction_quiet <= 0.0_real32) then
+    if (auto_rotate .and. interactive .and. .not. dragging .and. interaction_quiet <= 0.0_real32) then
       call apply_orientation_delta([0.0_real32,1.0_real32,0.0_real32], &
         0.58_real32*auto_speed*real(dt,real32))
       call apply_orientation_delta([0.0_real32,0.0_real32,1.0_real32], &
@@ -192,33 +197,216 @@ program fortran_shape_lab
     zbuffer = huge(1.0_real32)
 
     call render_frame(cols, ph, real(t,real32), orientation)
-    call draw_shape_outline(cols, ph)
+    if(draw_edges)call draw_shape_outline(cols, ph)
     if (mouse_present) then
       call cursor_hits_shape(mouse_x, mouse_y, mouse_over_object)
       call draw_interaction_cursor(cols, ph, mouse_x, mouse_y, mouse_over_object, dragging)
     end if
-    call build_frame_delta(cols, rows, used_bytes, force_redraw)
-
-    write(output_unit,'(A)',advance='no') ESC//'[?2026h'
-    if (used_bytes > 0) write(output_unit,'(A)',advance='no') frame_text(1:used_bytes)
-    if (show_hud) call write_hud()
-    write(output_unit,'(A)',advance='no') ESC//'[0m'//ESC//'[?2026l'
-    flush(output_unit)
+    if(interactive)then
+      call build_frame_delta(cols, rows, used_bytes, force_redraw)
+      if (used_bytes > 0) write(output_unit,'(A)',advance='no') frame_text(1:used_bytes)
+      if (show_hud) call write_hud()
+      write(output_unit,'(A)',advance='no') ESC//'[0m'
+      flush(output_unit)
+    else
+      call write_snapshot()
+    end if
     force_redraw = .false.
 
     frame_number = frame_number + 1
+    if(frame_limit>0)then
+      if(frame_number>=frame_limit)exit
+    end if
     call system_clock(frame_end)
     elapsed = real(frame_end - frame_start, real64) / real(clock_rate, real64)
     sleep_time = target_frame_time - elapsed
-    if (sleep_time > 0.0005_real64) call c_usleep(int(sleep_time*1000000.0_real64,c_int))
+    if (sleep_time > 0.0005_real64) call terminal_sleep(int(sleep_time*1000.0_real64,c_int))
   end do
 
-  write(output_unit,'(A)',advance='no') ESC//'[?2026l'//ESC//'[?1006l'//ESC//'[?1003l'//ESC//'[?1002l'// &
-       ESC//'[0m'//ESC//'[?7h'//ESC//'[?25h'//ESC//'[?1049l'
   flush(output_unit)
-  call execute_command_line('stty echo icanon', wait=.true.)
+  call terminal_close()
 
 contains
+
+  subroutine fail(message)
+    character(len=*),intent(in)::message
+    call terminal_close()
+    write(error_unit,'(A)')'shapes: '//message
+    stop 2
+  end subroutine fail
+
+  function canonical(value) result(result_value)
+    character(len=*),intent(in)::value
+    character(len=len_trim(value))::result_value
+    integer::i,k
+    result_value=trim(value)
+    do i=1,len(result_value)
+      k=iachar(result_value(i:i))
+      if(k>=65.and.k<=90)result_value(i:i)=achar(k+32)
+      if(result_value(i:i)==' '.or.result_value(i:i)=='_')result_value(i:i)='-'
+    end do
+  end function canonical
+
+  integer function positive_integer(value,label,limit) result(number)
+    character(len=*),intent(in)::value,label
+    integer,intent(in)::limit
+    integer::ios
+    if(len_trim(value)==0.or.verify(trim(value),'0123456789')/=0)call fail('invalid '//label)
+    read(value,*,iostat=ios)number
+    if(ios/=0)call fail('invalid '//label)
+    if(number<1.or.number>limit)call fail(label//' out of range')
+  end function positive_integer
+
+  integer function lookup_name(value,names) result(id)
+    character(len=*),intent(in)::value,names(:)
+    integer::i,ios
+    ios=1;id=0
+    if(verify(value,'0123456789')==0)read(value,*,iostat=ios)id
+    if(ios==0)then
+      if(id>=1.and.id<=size(names))return
+    end if
+    do i=1,size(names)
+      if(canonical(value)==canonical(trim(names(i))))then
+        id=i;return
+      end if
+    end do
+    call fail('unknown selection: '//trim(value))
+  end function lookup_name
+
+  subroutine option_value(index,value)
+    integer,intent(inout)::index
+    character(len=*),intent(inout)::value
+    integer::stat
+    if(len_trim(value)>0)return
+    index=index+1
+    if(index>command_argument_count())call fail('missing option value; use --help for usage')
+    call get_command_argument(index,value,status=stat)
+    if(stat/=0.or.len_trim(value)==0)call fail('invalid or overlong option value')
+  end subroutine option_value
+
+  subroutine parse_options()
+    character(len=256)::option,value
+    integer::i,j,k,ios,stat
+    i=1
+    do while(i<=command_argument_count())
+      call get_command_argument(i,option,status=stat)
+      if(stat/=0)call fail('overlong argument')
+      value='';j=index(option,'=')
+      if(j>0)then
+        value=option(j+1:);option=option(:j-1)
+        if(len_trim(value)==0)call fail('missing option value')
+        select case(trim(option))
+        case('--shape','--theme','--color','--size','--cell-aspect','--fps','--frames')
+        case default
+          call fail('this option does not take a value: '//trim(option))
+        end select
+      end if
+      select case(trim(option))
+      case('--help','-h')
+        write(output_unit,'(A)') &
+          'Shape Lab - portable, lit 3D shapes in your terminal', &
+          'Usage: shapes [options]', &
+          '  --shape NAME|N       Start with a shape (see --list-shapes)', &
+          '  --theme NAME|N       Neon Ice, Sunset Chrome, Emerald Lab, Studio Neutral, Vaporwave', &
+          '  --color MODE         auto, truecolor, 256, 16, mono (respects NO_COLOR)', &
+          '  --ascii / --unicode  Override automatic character selection', &
+          '  --snapshot           Print one ASCII frame without terminal controls', &
+          '  --size COLSxROWS      Limit viewport; snapshot dimensions (1..1000 x 1..500)', &
+          '  --cell-aspect RATIO   Character width / height (default: detect, or 0.5)', &
+          '  --fps N              Frame limit, 1..120 (default 30)', &
+          '  --frames N           Exit after N frames', &
+          '  --no-mouse           Use keyboard controls only', &
+          '  --ansi               Enable basic ANSI on an unrecognized terminal', &
+          '  --no-alt-screen      Render on the main screen', &
+          '  --no-spin / --no-hud / --no-edges', &
+          '  --list-shapes        List all 20 shapes', &
+          '  --check-meshes       Validate all generated meshes', &
+          'Controls: drag / arrows / WASD rotate; wheel / Z X zoom;', &
+          '1..9, 0 select shapes 1..10; N / Tab next; P previous; T theme;', &
+          'Space pause; [ ] speed; R reset; E edges; H interface; Q quit.'
+        stop
+      case('--list-shapes')
+        do k=1,max_shape
+          write(output_unit,'(I2,2A)')k,'  ',trim(shape_names(k))
+        end do
+        stop
+      case('--shape')
+        call option_value(i,value);shape_id=lookup_name(trim(value),shape_names)
+      case('--theme')
+        call option_value(i,value);theme_id=lookup_name(trim(value),theme_names)
+      case('--color')
+        call option_value(i,value)
+        select case(trim(value))
+        case('auto');color_mode=-1
+        case('truecolor','24bit');color_mode=16777216
+        case('256');color_mode=256
+        case('16');color_mode=16
+        case('mono','none');color_mode=0
+        case default;call fail('unknown color mode: '//trim(value))
+        end select
+      case('--size')
+        call option_value(i,value);j=index(value,'x')
+        if(j==0)j=index(value,'X')
+        if(j<2.or.j>=len_trim(value))call fail('size must be COLSxROWS')
+        requested_cols=positive_integer(value(:j-1),'column count',1000)
+        requested_rows=positive_integer(trim(value(j+1:)),'row count',500)
+      case('--cell-aspect')
+        call option_value(i,value)
+        if(verify(trim(value),'0123456789.eEdD+-')/=0)call fail('invalid cell aspect ratio')
+        read(value,*,iostat=ios)requested_aspect
+        if(ios/=0)call fail('invalid cell aspect ratio')
+        if(.not.ieee_is_finite(requested_aspect))call fail('invalid cell aspect ratio')
+        if(requested_aspect<0.2.or.requested_aspect>1.2)call fail('cell aspect must be between 0.2 and 1.2')
+      case('--fps','--frames')
+        call option_value(i,value);k=positive_integer(trim(value),'frame count or rate',100000000)
+        if(option=='--fps')then
+          if(k>120)call fail('fps must be within 1..120')
+          target_fps=k
+        else
+          frame_limit=k
+        end if
+      case('--ascii');unicode_mode=0
+      case('--unicode');unicode_mode=1
+      case('--snapshot','--plain');plain_mode=1
+      case('--ansi');plain_mode=-1
+      case('--no-mouse');mouse_mode=0
+      case('--no-alt-screen');alternate_mode=0
+      case('--no-spin');initial_spin=.false.
+      case('--no-hud');initial_hud=.false.
+      case('--no-edges');draw_edges=.false.
+      case('--check-meshes');check_meshes=.true.
+      case default
+        call fail('unknown option: '//trim(option)//'; use --help for usage')
+      end select
+      i=i+1
+    end do
+  end subroutine parse_options
+
+  subroutine validate_meshes()
+    integer::id,ti,level
+    real(real32)::normal(3)
+    do level=12,40,14
+      detail=level
+      do id=1,max_shape
+        call load_shape(id,mesh)
+        if(.not.all(ieee_is_finite(mesh%v)).or..not.all(ieee_is_finite(mesh%n)))call fail('nonfinite mesh')
+        if(minval(mesh%tri)<1.or.maxval(mesh%tri)>mesh%nv)call fail('invalid triangle index')
+        if(mesh%ne>0)then
+          if(minval(mesh%edge)<1.or.maxval(mesh%edge)>mesh%nv)call fail('invalid edge index')
+        end if
+        do ti=1,mesh%nv
+          if(abs(sum(mesh%n(:,ti)**2)-1.0_real32)>0.001_real32)call fail('invalid vertex normal')
+          if(sqrt(sum(mesh%v(:,ti)**2))>1.301_real32)call fail('mesh exceeds framing radius')
+        end do
+        do ti=1,mesh%nt
+          normal=cross3(mesh%v(:,mesh%tri(2,ti))-mesh%v(:,mesh%tri(1,ti)), &
+                        mesh%v(:,mesh%tri(3,ti))-mesh%v(:,mesh%tri(1,ti)))
+          if(sum(normal**2)<1.0e-14_real32)call fail('degenerate triangle in '//trim(mesh%name))
+        end do
+      end do
+    end do
+    write(output_unit,'(A)')'All 20 meshes passed validation at three detail levels.'
+  end subroutine validate_meshes
 
   subroutine init_decimal_table()
     integer :: i
@@ -230,6 +418,8 @@ contains
   subroutine load_shape(id, m)
     integer, intent(in) :: id
     type(mesh_type), intent(inout) :: m
+    real(real32)::radius
+    integer::i
 
     if (allocated(m%v)) deallocate(m%v)
     if (allocated(m%n)) deallocate(m%n)
@@ -242,13 +432,330 @@ contains
     case(2)
       call init_icosahedron(m)
     case(3)
-      call init_sphere(m, 16, 32)
+      call init_sphere(m, detail, 2*detail)
     case(4)
-      call init_torus(m, 36, 18)
-    case default
+      call init_torus(m, 3*detail, detail)
+    case(5)
       call init_tetrahedron(m)
+    case(6)
+      call init_bipyramid(m,4)
+    case(7)
+      call init_dodecahedron(m)
+    case(8)
+      call init_prism(m,2*detail,.true.)
+    case(9)
+      call init_cone(m,2*detail)
+    case(10)
+      call init_capsule(m,detail,2*detail)
+    case(11)
+      call init_prism(m,3,.false.)
+    case(12)
+      call init_prism(m,6,.false.)
+    case(13)
+      call init_pyramid(m)
+    case(14,17,20)
+      call init_sphere(m,detail,2*detail)
+      call deform_sphere(m,id)
+    case(15,19)
+      call init_tube(m,id==19,6*detail,max(10,detail/2))
+    case(16)
+      call init_mobius(m,4*detail,max(6,detail/3))
+    case(18)
+      call init_bipyramid(m,6)
     end select
+    m%name=shape_names(id)
+    radius=maxval(sqrt(sum(m%v**2,dim=1)))
+    m%v=m%v*(1.3_real32/max(radius,0.001_real32))
+    if(allocated(world))deallocate(world,world_normals,screen_x,screen_y,vertex_depth,projected)
+    allocate(world(3,m%nv),world_normals(3,m%nv),screen_x(m%nv),screen_y(m%nv), &
+      vertex_depth(m%nv),projected(m%nv))
+    do i=1,m%nv
+      m%n(:,i)=normalize3(m%n(:,i))
+    end do
   end subroutine load_shape
+
+  subroutine init_bipyramid(m,sides)
+    type(mesh_type),intent(out)::m
+    integer,intent(in)::sides
+    integer::i,j
+    real(real32)::angle,height
+    m%nv=sides+2;m%nt=2*sides;m%ne=3*sides
+    allocate(m%v(3,m%nv),m%n(3,m%nv),m%tri(3,m%nt),m%edge(2,m%ne))
+    height=merge(1.0_real32,1.8_real32,sides==4)
+    m%v(:,1)=[0.0_real32,height,0.0_real32]
+    m%v(:,2)=[0.0_real32,-height,0.0_real32]
+    do i=1,sides
+      angle=2*PI*real(i-1,real32)/real(sides,real32)
+      m%v(:,i+2)=[cos(angle),0.0_real32,sin(angle)]
+      j=mod(i,sides)+3
+      m%tri(:,2*i-1)=[1,i+2,j];m%tri(:,2*i)=[2,j,i+2]
+      m%edge(:,3*i-2)=[1,i+2];m%edge(:,3*i-1)=[2,i+2];m%edge(:,3*i)=[i+2,j]
+    end do
+    m%n=m%v
+  end subroutine init_bipyramid
+
+  subroutine init_pyramid(m)
+    type(mesh_type),intent(out)::m
+    m%nv=5;m%nt=6;m%ne=8
+    allocate(m%v(3,5),m%n(3,5),m%tri(3,6),m%edge(2,8))
+    m%v=reshape([ &
+      -1.0_real32,-.65_real32,-1.0_real32, 1.0_real32,-.65_real32,-1.0_real32, &
+       1.0_real32,-.65_real32, 1.0_real32,-1.0_real32,-.65_real32, 1.0_real32, &
+       0.0_real32,1.2_real32,0.0_real32],[3,5])
+    m%n=m%v
+    m%tri=reshape([1,2,3,1,3,4,1,5,2,2,5,3,3,5,4,4,5,1],[3,6])
+    m%edge=reshape([1,2,2,3,3,4,4,1,1,5,2,5,3,5,4,5],[2,8])
+  end subroutine init_pyramid
+
+  subroutine init_dodecahedron(m)
+    type(mesh_type),intent(out)::m
+    type(mesh_type),allocatable::ico
+    integer::i,j,k,a,b,n,ids(5),swap,ti,ne,edges(2,60)
+    real(real32)::axis(3),tangent(3),bitangent(3),angles(5),temp
+    logical::found
+    allocate(ico)
+    call init_icosahedron(ico)
+    m%nv=20;m%nt=36
+    allocate(m%v(3,20),m%n(3,20),m%tri(3,36))
+    do i=1,20
+      m%v(:,i)=normalize3(sum(ico%v(:,ico%tri(:,i)),dim=2));m%n(:,i)=m%v(:,i)
+    end do
+    ti=0;ne=0
+    do i=1,12
+      axis=normalize3(ico%v(:,i));tangent=normalize3(cross3(axis,[0.0_real32,1.0_real32,0.0_real32]))
+      bitangent=cross3(axis,tangent);n=0
+      do j=1,20
+        if(.not.any(ico%tri(:,j)==i))cycle
+        n=n+1;ids(n)=j
+        angles(n)=atan2(dot_product(m%v(:,j),bitangent),dot_product(m%v(:,j),tangent))
+      end do
+      do j=2,5
+        k=j
+        do while(k>1)
+          if(angles(k)>=angles(k-1))exit
+          temp=angles(k);angles(k)=angles(k-1);angles(k-1)=temp
+          swap=ids(k);ids(k)=ids(k-1);ids(k-1)=swap;k=k-1
+        end do
+      end do
+      do j=2,4
+        ti=ti+1;m%tri(:,ti)=[ids(1),ids(j),ids(j+1)]
+      end do
+      do j=1,5
+        a=min(ids(j),ids(mod(j,5)+1));b=max(ids(j),ids(mod(j,5)+1));found=.false.
+        do k=1,ne
+          if(edges(1,k)==a.and.edges(2,k)==b)found=.true.
+        end do
+        if(.not.found)then
+          ne=ne+1;edges(:,ne)=[a,b]
+        end if
+      end do
+    end do
+    m%ne=ne;allocate(m%edge(2,ne));m%edge=edges(:,:ne)
+  end subroutine init_dodecahedron
+
+  subroutine init_prism(m,sides,smooth)
+    type(mesh_type),intent(out)::m
+    integer,intent(in)::sides
+    logical,intent(in)::smooth
+    integer::i,j,ti
+    real(real32)::angle,normal(3)
+    m%nv=4*sides+2;m%nt=4*sides;m%smooth=smooth
+    m%ne=0
+    if(.not.smooth)m%ne=3*sides
+    allocate(m%v(3,m%nv),m%n(3,m%nv),m%tri(3,m%nt),m%edge(2,m%ne))
+    do i=1,sides
+      angle=2*PI*real(i-1,real32)/real(sides,real32);normal=[cos(angle),0.0_real32,sin(angle)]
+      m%v(:,i)=normal+[0.0_real32,-0.9_real32,0.0_real32]
+      m%v(:,sides+i)=normal+[0.0_real32,0.9_real32,0.0_real32]
+      m%v(:,2*sides+i)=m%v(:,i);m%v(:,3*sides+i)=m%v(:,sides+i)
+      m%n(:,i)=normal;m%n(:,sides+i)=normal
+      m%n(:,2*sides+i)=[0.0_real32,-1.0_real32,0.0_real32]
+      m%n(:,3*sides+i)=[0.0_real32,1.0_real32,0.0_real32]
+      j=mod(i,sides)+1;ti=4*i-3
+      m%tri(:,ti)=[i,j,sides+j];m%tri(:,ti+1)=[i,sides+j,sides+i]
+      m%tri(:,ti+2)=[4*sides+1,2*sides+j,2*sides+i]
+      m%tri(:,ti+3)=[4*sides+2,3*sides+i,3*sides+j]
+      if(.not.smooth)then
+        m%edge(:,3*i-2)=[i,j];m%edge(:,3*i-1)=[sides+i,sides+j];m%edge(:,3*i)=[i,sides+i]
+      end if
+    end do
+    m%v(:,4*sides+1)=[0.0_real32,-0.9_real32,0.0_real32]
+    m%v(:,4*sides+2)=[0.0_real32,0.9_real32,0.0_real32]
+    m%n(:,4*sides+1)=[0.0_real32,-1.0_real32,0.0_real32]
+    m%n(:,4*sides+2)=[0.0_real32,1.0_real32,0.0_real32]
+  end subroutine init_prism
+
+  subroutine init_cone(m,sides)
+    type(mesh_type),intent(out)::m
+    integer,intent(in)::sides
+    integer::i,j
+    real(real32)::angle
+    m%nv=3*sides+1;m%nt=2*sides;m%smooth=.true.
+    allocate(m%v(3,m%nv),m%n(3,m%nv),m%tri(3,m%nt),m%edge(2,0))
+    do i=1,sides
+      angle=2*PI*real(i-1,real32)/real(sides,real32)
+      m%v(:,i)=[cos(angle),-0.8_real32,sin(angle)]
+      m%n(:,i)=normalize3([cos(angle),0.5_real32,sin(angle)])
+      m%v(:,sides+i)=[0.0_real32,1.2_real32,0.0_real32]
+      m%n(:,sides+i)=normalize3([cos(angle+PI/sides),0.5_real32,sin(angle+PI/sides)])
+      m%v(:,2*sides+i)=m%v(:,i);m%n(:,2*sides+i)=[0.0_real32,-1.0_real32,0.0_real32]
+      j=mod(i,sides)+1
+      m%tri(:,2*i-1)=[i,j,sides+i];m%tri(:,2*i)=[3*sides+1,2*sides+i,2*sides+j]
+    end do
+    m%v(:,3*sides+1)=[0.0_real32,-0.8_real32,0.0_real32]
+    m%n(:,3*sides+1)=[0.0_real32,-1.0_real32,0.0_real32]
+  end subroutine init_cone
+
+  subroutine init_capsule(m,nlat,nlon)
+    type(mesh_type),intent(out)::m
+    integer,intent(in)::nlat,nlon
+    integer::j,k,idx,hem
+    real(real32)::theta,phi,offset
+    hem=max(4,nlat/2)
+    call init_sphere(m,2*hem+1,nlon)
+    m%v(:,1)=[0.0_real32,1.45_real32,0.0_real32]
+    m%v(:,m%nv)=[0.0_real32,-1.45_real32,0.0_real32]
+    idx=2
+    do j=1,2*hem
+      if(j<=hem)then
+        theta=PI*0.5_real32*real(j,real32)/hem;offset=0.45_real32
+      else
+        theta=PI*0.5_real32*(1.0_real32+real(j-hem-1,real32)/hem);offset=-0.45_real32
+      end if
+      do k=0,nlon-1
+        phi=2*PI*real(k,real32)/nlon
+        m%n(:,idx)=[sin(theta)*cos(phi),cos(theta),sin(theta)*sin(phi)]
+        m%v(:,idx)=m%n(:,idx)+[0.0_real32,offset,0.0_real32];idx=idx+1
+      end do
+    end do
+  end subroutine init_capsule
+
+  subroutine deform_sphere(m,kind)
+    type(mesh_type),intent(inout)::m
+    integer,intent(in)::kind
+    integer::i,j,ids(3)
+    real(real32)::n(3),u,v,r,normal(3)
+    do i=1,m%nv
+      n=m%n(:,i)
+      select case(kind)
+      case(14)
+        m%v(:,i)=sign(abs(n)**0.45_real32,n)
+        m%n(:,i)=normalize3(sign(abs(m%v(:,i))**(2.0_real32/0.45_real32-1.0_real32),m%v(:,i)))
+      case(17)
+        u=atan2(n(3),n(1));v=acos(clamp_real(n(2),-1.0_real32,1.0_real32))
+        r=1.0_real32+0.24_real32*cos(5*u)*sin(v)**3+0.10_real32*cos(3*v)
+        m%v(:,i)=n*r
+      case(20)
+        m%v(:,i)=n*[1.3_real32,0.72_real32,0.95_real32]
+        m%n(:,i)=normalize3(n/[1.3_real32,0.72_real32,0.95_real32])
+      end select
+    end do
+    if(kind/=17)return
+    m%n=0.0_real32
+    do i=1,m%nt
+      ids=m%tri(:,i)
+      normal=cross3(m%v(:,ids(2))-m%v(:,ids(1)),m%v(:,ids(3))-m%v(:,ids(1)))
+      if(dot_product(normal,sum(m%v(:,ids),dim=2))<0)normal=-normal
+      do j=1,3
+        m%n(:,ids(j))=m%n(:,ids(j))+normal
+      end do
+    end do
+  end subroutine deform_sphere
+
+  function tube_center(u,spring) result(point)
+    real(real32),intent(in)::u
+    logical,intent(in)::spring
+    real(real32)::point(3),r
+    if(spring)then
+      point=[cos(3*u),1.6_real32*(u/PI-1.0_real32),sin(3*u)]
+    else
+      r=0.85_real32+0.30_real32*cos(3*u)
+      point=[r*cos(2*u),0.30_real32*sin(3*u),r*sin(2*u)]
+    end if
+  end function tube_center
+
+  subroutine init_tube(m,spring,segments,sides)
+    type(mesh_type),intent(out)::m
+    logical,intent(in)::spring
+    integer,intent(in)::segments,sides
+    integer::rings,a,b,a1,b1,idx,ti,i00,i10,i11,i01
+    real(real32)::u,v,center(3),tangent(3),normal(3),binormal(3),radius
+    rings=segments
+    if(spring)rings=rings+1
+    m%nv=rings*sides;m%nt=2*segments*sides;m%smooth=.true.
+    if(spring)then
+      m%nv=m%nv+2*sides+2;m%nt=m%nt+2*sides
+    end if
+    allocate(m%v(3,m%nv),m%n(3,m%nv),m%tri(3,m%nt),m%edge(2,0))
+    radius=merge(0.16_real32,0.145_real32,spring)
+    do a=0,rings-1
+      u=2*PI*real(a,real32)/segments;center=tube_center(u,spring)
+      tangent=normalize3(tube_center(u+0.001_real32,spring)-tube_center(u-0.001_real32,spring))
+      normal=normalize3(cross3(tangent,[0.0_real32,1.0_real32,0.0_real32]));binormal=cross3(tangent,normal)
+      do b=0,sides-1
+        v=2*PI*real(b,real32)/sides;idx=a*sides+b+1
+        m%n(:,idx)=normal*cos(v)+binormal*sin(v);m%v(:,idx)=center+radius*m%n(:,idx)
+      end do
+    end do
+    ti=0
+    do a=0,segments-1
+      a1=mod(a+1,rings)
+      do b=0,sides-1
+        b1=mod(b+1,sides);i00=a*sides+b+1;i10=a1*sides+b+1;i11=a1*sides+b1+1;i01=a*sides+b1+1
+        ti=ti+1;m%tri(:,ti)=[i00,i10,i11];ti=ti+1;m%tri(:,ti)=[i00,i11,i01]
+      end do
+    end do
+    if(.not.spring)return
+    m%v(:,m%nv-1)=tube_center(0.0_real32,.true.);m%v(:,m%nv)=tube_center(2*PI,.true.)
+    m%n(:,m%nv-1)=normalize3(tube_center(-0.001_real32,.true.)-tube_center(0.001_real32,.true.))
+    m%n(:,m%nv)=normalize3(tube_center(2*PI+0.001_real32,.true.)-tube_center(2*PI-0.001_real32,.true.))
+    do b=0,sides-1
+      b1=mod(b+1,sides)
+      m%v(:,rings*sides+b+1)=m%v(:,b+1)
+      m%v(:,(rings+1)*sides+b+1)=m%v(:,(rings-1)*sides+b+1)
+      m%n(:,rings*sides+b+1)=m%n(:,m%nv-1)
+      m%n(:,(rings+1)*sides+b+1)=m%n(:,m%nv)
+      ti=ti+1;m%tri(:,ti)=[m%nv-1,rings*sides+b+1,rings*sides+b1+1]
+      ti=ti+1;m%tri(:,ti)=[m%nv,(rings+1)*sides+b1+1,(rings+1)*sides+b+1]
+    end do
+  end subroutine init_tube
+
+  function mobius_point(u,v) result(point)
+    real(real32),intent(in)::u,v
+    real(real32)::point(3)
+    point=[(1+v*cos(u/2))*cos(u),v*sin(u/2),(1+v*cos(u/2))*sin(u)]
+  end function mobius_point
+
+  subroutine init_mobius(m,segments,width)
+    type(mesh_type),intent(out)::m
+    integer,intent(in)::segments,width
+    integer::a,b,idx,ti,i00,i01,i10,i11
+    real(real32)::u,v,du(3),dv(3)
+    m%nv=segments*(width+1);m%nt=2*segments*width;m%smooth=.true.;m%two_sided=.true.
+    allocate(m%v(3,m%nv),m%n(3,m%nv),m%tri(3,m%nt),m%edge(2,0))
+    do a=0,segments-1
+      u=2*PI*real(a,real32)/segments
+      do b=0,width
+        v=0.8_real32*(real(b,real32)/width-0.5_real32);idx=a*(width+1)+b+1
+        m%v(:,idx)=mobius_point(u,v)
+        du=mobius_point(u+0.001_real32,v)-mobius_point(u-0.001_real32,v)
+        dv=mobius_point(u,v+0.001_real32)-mobius_point(u,v-0.001_real32)
+        m%n(:,idx)=normalize3(cross3(du,dv))
+      end do
+    end do
+    ti=0
+    do a=0,segments-1
+      do b=0,width-1
+        i00=a*(width+1)+b+1;i01=i00+1
+        if(a==segments-1)then
+          i10=width-b+1;i11=width-b
+        else
+          i10=(a+1)*(width+1)+b+1;i11=i10+1
+        end if
+        ti=ti+1;m%tri(:,ti)=[i00,i10,i11];ti=ti+1;m%tri(:,ti)=[i00,i11,i01]
+      end do
+    end do
+  end subroutine init_mobius
 
   subroutine init_cube(m)
     type(mesh_type), intent(out) :: m
@@ -463,118 +970,135 @@ contains
 
   subroutine terminal_size(out_cols, out_rows)
     integer,intent(out)::out_cols,out_rows
-    type(winsize),target::ws
-    integer(c_int)::rc
-    character(len=64)::env
-    integer::stat,ios
-    out_cols=100; out_rows=40
-    ws=winsize(0_c_short,0_c_short,0_c_short,0_c_short)
-    rc=c_ioctl(1_c_int,TIOCGWINSZ,c_loc(ws))
-    if (rc==0 .and. int(ws%ws_col)>0 .and. int(ws%ws_row)>0) then
-      out_cols=int(ws%ws_col); out_rows=int(ws%ws_row)
+    integer(c_int)::width,height
+    real(c_double)::aspect
+    call native_terminal_size(width,height,aspect)
+    cell_aspect=real(aspect,real32)
+    if(requested_aspect>0)cell_aspect=requested_aspect
+    ! Leave the final column unused: even terminals without DECAWM cannot scroll on a bottom-right write.
+    if(interactive)width=max(1_c_int,width-1_c_int)
+    if(interactive)then
+      if(requested_cols>0)width=min(width,int(requested_cols,c_int))
+      if(requested_rows>0)height=min(height,int(requested_rows,c_int))
     else
-      call get_environment_variable('COLUMNS',env,status=stat)
-      if (stat==0) then; read(env,*,iostat=ios) out_cols; if(ios/=0)out_cols=100; end if
-      call get_environment_variable('LINES',env,status=stat)
-      if (stat==0) then; read(env,*,iostat=ios) out_rows; if(ios/=0)out_rows=40; end if
+      if(requested_cols>0)width=int(requested_cols,c_int)
+      if(requested_rows>0)height=int(requested_rows,c_int)
     end if
-    out_cols=max(out_cols,40); out_rows=max(out_rows,16)
+    out_cols=max(1,min(int(width),1000));out_rows=max(1,min(int(height),500))
   end subroutine terminal_size
+
+  subroutine update_layout()
+    hud_top=0;hud_bottom=0
+    if(show_hud)then
+      if(rows>=5.and.cols>=20)hud_top=1
+      if(rows>=3.and.cols>=10)hud_bottom=1
+    end if
+    view_top=2*hud_top+1;view_height=max(2,2*(rows-hud_top-hud_bottom))
+    pixel_aspect=2.0_real32*cell_aspect
+    projection_scale=min(real(cols,real32)*pixel_aspect,real(view_height,real32))*1.38_real32
+    detail=max(16,min(40,nint(min(real(cols,real32)*pixel_aspect,real(view_height,real32))/2.5_real32)))
+  end subroutine update_layout
 
   subroutine ensure_buffers(w,r)
     integer,intent(in)::w,r
-    integer::height,needed
+    integer::height,needed,stat
+    call update_layout()
     height=r*2; needed=r*(w*cell_bytes+40)+256
     if (allocated(pixels)) then
       if(size(pixels,1)==w .and. size(pixels,2)==height) return
-      deallocate(pixels,background,previous_pixels,zbuffer)
+      deallocate(pixels,background,zbuffer,previous_fg,previous_bg,previous_glyph)
       if(allocated(frame_text))deallocate(frame_text)
     end if
-    allocate(pixels(w,height),background(w,height),previous_pixels(w,height),zbuffer(w,height))
-    allocate(character(len=needed)::frame_text)
+    allocate(pixels(w,height),background(w,height),zbuffer(w,height), &
+      previous_fg(w,r),previous_bg(w,r),previous_glyph(w,r),stat=stat)
+    if(stat/=0)call fail('unable to allocate the viewport; try a smaller --size')
+    allocate(character(len=needed)::frame_text,stat=stat)
+    if(stat/=0)call fail('unable to allocate the frame buffer; try a smaller --size')
     call make_background(w,height)
-    previous_pixels=-1_int32
+    previous_fg=-1;previous_bg=-1;previous_glyph=achar(0)
     zbuffer=huge(1.0_real32)
   end subroutine ensure_buffers
 
   subroutine rebuild_background()
     call make_background(cols,rows*2)
-    previous_pixels=-1_int32
+    previous_fg=-1;previous_bg=-1;previous_glyph=achar(0)
     force_redraw=.true.
   end subroutine rebuild_background
 
   subroutine render_frame(w,height,time,rot)
     integer,intent(in)::w,height
     real(real32),intent(in)::time,rot(3,3)
-    real(real32),allocatable::world(:,:),wn(:,:),sx(:),sy(:),depth(:)
-    logical,allocatable::ok(:)
-    real(real32)::bob,face_n(3),centroid(3),camera_pos(3)
+    real(real32)::bob,face_n(3),centroid(3),camera_pos(3),tri_normals(3,3)
     real(real32)::shadow_x,shadow_y,shadow_depth,object_scale
     logical::shadow_ok
-    integer::i,ti,eidx,ids(3),base_col(3)
+    integer::i,j,ti,eidx,ids(3),base_col(3)
     real(real32)::edge_pulse
 
-    allocate(world(3,mesh%nv),wn(3,mesh%nv),sx(mesh%nv),sy(mesh%nv),depth(mesh%nv),ok(mesh%nv))
     bob=0.075_real32*sin(time*1.15_real32)
     object_scale=merge(1.03_real32,1.0_real32,mesh%smooth)
     do i=1,mesh%nv
       world(:,i)=matmul(rot,mesh%v(:,i))*object_scale
-      world(2,i)=world(2,i)+0.27_real32+bob
-      wn(:,i)=normalize3(matmul(rot,mesh%n(:,i)))
-      call project_point(world(:,i),w,height,sx(i),sy(i),depth(i),ok(i))
+      world(2,i)=world(2,i)+0.10_real32+bob
+      world_normals(:,i)=normalize3(matmul(rot,mesh%n(:,i)))
+      call project_point(world(:,i),w,screen_x(i),screen_y(i),vertex_depth(i),projected(i))
     end do
 
-    call project_point([0.0_real32,-1.30_real32,0.18_real32],w,height,shadow_x,shadow_y,shadow_depth,shadow_ok)
+    call project_point([0.0_real32,-1.30_real32,0.18_real32],w,shadow_x,shadow_y,shadow_depth,shadow_ok)
     if(shadow_ok)call draw_soft_shadow(w,height,shadow_x,shadow_y, &
-      min(real(w,real32),real(height,real32))*.235_real32, &
-      min(real(w,real32),real(height,real32))*.055_real32,time)
+      projection_scale*.26_real32/pixel_aspect,projection_scale*.045_real32,time)
 
     camera_pos=[0.0_real32,0.0_real32,-camera_distance]
     do ti=1,mesh%nt
       ids=mesh%tri(:,ti)
-      if(.not.all(ok(ids)))cycle
-      if(mesh%smooth)then
-        face_n=normalize3(wn(:,ids(1))+wn(:,ids(2))+wn(:,ids(3)))
+      if(.not.all(projected(ids)))cycle
+      centroid=sum(world(:,ids),dim=2)/3.0_real32
+      tri_normals=world_normals(:,ids)
+      if(mesh%two_sided)then
+        face_n=normalize3(cross3(world(:,ids(2))-world(:,ids(1)),world(:,ids(3))-world(:,ids(1))))
+        do j=1,3
+          if(dot_product(tri_normals(:,j),face_n)<0)tri_normals(:,j)=-tri_normals(:,j)
+        end do
+        if(dot_product(face_n,camera_pos-centroid)<0)then
+          face_n=-face_n;tri_normals=-tri_normals
+        end if
+      else if(mesh%smooth)then
+        face_n=normalize3(sum(tri_normals,dim=2))
       else
         face_n=normalize3(cross3(world(:,ids(2))-world(:,ids(1)),world(:,ids(3))-world(:,ids(1))))
-        centroid=(world(:,ids(1))+world(:,ids(2))+world(:,ids(3)))/3.0_real32
-        if(dot_product(face_n,centroid)<0.0_real32)face_n=-face_n
+        if(dot_product(face_n,sum(tri_normals,dim=2))<0)face_n=-face_n
       end if
-      centroid=(world(:,ids(1))+world(:,ids(2))+world(:,ids(3)))/3.0_real32
       if(dot_product(face_n,camera_pos-centroid)<=0.015_real32)cycle
-      call material_color(ti,face_n,base_col)
+      call material_color(face_n,base_col)
       if(mesh%smooth)then
         call fill_lit_triangle(w,height, &
-          sx(ids(1)),sy(ids(1)),depth(ids(1)),world(:,ids(1)),wn(:,ids(1)), &
-          sx(ids(2)),sy(ids(2)),depth(ids(2)),world(:,ids(2)),wn(:,ids(2)), &
-          sx(ids(3)),sy(ids(3)),depth(ids(3)),world(:,ids(3)),wn(:,ids(3)),base_col)
+          screen_x(ids(1)),screen_y(ids(1)),vertex_depth(ids(1)),world(:,ids(1)),tri_normals(:,1), &
+          screen_x(ids(2)),screen_y(ids(2)),vertex_depth(ids(2)),world(:,ids(2)),tri_normals(:,2), &
+          screen_x(ids(3)),screen_y(ids(3)),vertex_depth(ids(3)),world(:,ids(3)),tri_normals(:,3),base_col)
       else
         call fill_lit_triangle(w,height, &
-          sx(ids(1)),sy(ids(1)),depth(ids(1)),world(:,ids(1)),face_n, &
-          sx(ids(2)),sy(ids(2)),depth(ids(2)),world(:,ids(2)),face_n, &
-          sx(ids(3)),sy(ids(3)),depth(ids(3)),world(:,ids(3)),face_n,base_col)
+          screen_x(ids(1)),screen_y(ids(1)),vertex_depth(ids(1)),world(:,ids(1)),face_n, &
+          screen_x(ids(2)),screen_y(ids(2)),vertex_depth(ids(2)),world(:,ids(2)),face_n, &
+          screen_x(ids(3)),screen_y(ids(3)),vertex_depth(ids(3)),world(:,ids(3)),face_n,base_col)
       end if
     end do
 
-    if(mesh%ne>0)then
+    if(mesh%ne>0.and.draw_edges)then
       edge_pulse=.92_real32+.08_real32*sin(time*1.55_real32)
       do eidx=1,mesh%ne
-        if(ok(mesh%edge(1,eidx)).and.ok(mesh%edge(2,eidx)))then
+        if(projected(mesh%edge(1,eidx)).and.projected(mesh%edge(2,eidx)))then
           call draw_glowing_line(w,height, &
-            sx(mesh%edge(1,eidx)),sy(mesh%edge(1,eidx)),depth(mesh%edge(1,eidx)), &
-            sx(mesh%edge(2,eidx)),sy(mesh%edge(2,eidx)),depth(mesh%edge(2,eidx)),edge_pulse)
+            screen_x(mesh%edge(1,eidx)),screen_y(mesh%edge(1,eidx)),vertex_depth(mesh%edge(1,eidx)), &
+            screen_x(mesh%edge(2,eidx)),screen_y(mesh%edge(2,eidx)),vertex_depth(mesh%edge(2,eidx)),edge_pulse)
         end if
       end do
     end if
-    deallocate(world,wn,sx,sy,depth,ok)
   end subroutine render_frame
 
-  subroutine material_color(tri_idx,normal,col)
-    integer,intent(in)::tri_idx
+  subroutine material_color(normal,col)
     real(real32),intent(in)::normal(3)
     integer,intent(out)::col(3)
     real(real32)::mixv
-    mixv=.17_real32+.22_real32*(normal(2)*.5_real32+.5_real32)+.08_real32*sin(real(tri_idx,real32)*1.71_real32)
+    mixv=.17_real32+.22_real32*(normal(2)*.5_real32+.5_real32)+.08_real32*normal(1)*normal(3)
     mixv=clamp01(mixv)
     col=nint(real(theme%base_a,real32)*(1.0_real32-mixv)+real(theme%base_b,real32)*mixv)
   end subroutine material_color
@@ -747,7 +1271,8 @@ contains
     real(real32)::a,depth,r2,alpha
     steps=max(abs(nint(x1-x0)),abs(nint(y1-y0)))+1; steps=max(steps,1)
     do i=0,steps
-      a=real(i,real32)/real(steps,real32); x=nint(x0+(x1-x0)*a); y=nint(y0+(y1-y0)*a); depth=z0+(z1-z0)*a
+      a=real(i,real32)/real(steps,real32);x=nint(x0+(x1-x0)*a);y=nint(y0+(y1-y0)*a)
+      depth=1.0_real32/((1.0_real32-a)/z0+a/z1)
       do oy=-1,1
         do ox=-1,1
           r2=real(ox*ox+oy*oy,real32); alpha=pulse*.13_real32*exp(-.95_real32*r2)
@@ -851,17 +1376,15 @@ contains
     end do
   end subroutine draw_interaction_cursor
 
-  subroutine project_point(point,w,height,sx,sy,depth,ok)
+  subroutine project_point(point,w,sx,sy,depth,ok)
     real(real32),intent(in)::point(3)
-    integer,intent(in)::w,height
+    integer,intent(in)::w
     real(real32),intent(out)::sx,sy,depth
     logical,intent(out)::ok
-    real(real32)::scale
     depth=point(3)+camera_distance
     if(depth<=.20_real32)then; sx=0.0; sy=0.0; ok=.false.; return; end if
-    scale=min(real(w,real32)*1.70_real32,real(height,real32))*.80_real32
-    sx=real(w,real32)*.5_real32+point(1)*scale/depth
-    sy=real(height,real32)*.47_real32-point(2)*scale/depth
+    sx=(real(w,real32)+1)*.5_real32+point(1)*projection_scale/(depth*pixel_aspect)
+    sy=real(view_top,real32)-.5_real32+real(view_height,real32)*.5_real32-point(2)*projection_scale/depth
     ok=.true.
   end subroutine project_point
 
@@ -912,9 +1435,9 @@ contains
     real(real32),intent(out)::vector(3)
     real(real32)::screen_x,screen_y,radius,distance2
 
-    radius=max(4.0_real32,min(real(cols,real32),real(rows*2,real32))*.42_real32)
-    screen_x=(real(cell_x,real32)-real(cols,real32)*.5_real32)/radius
-    screen_y=(real(rows*2,real32)*.47_real32-real((cell_y-1)*2+1,real32))/radius
+    radius=max(2.0_real32,min(real(cols,real32)*pixel_aspect,real(view_height,real32))*.42_real32)
+    screen_x=(real(cell_x,real32)-(real(cols,real32)+1)*.5_real32)*pixel_aspect/radius
+    screen_y=(real(view_top,real32)+real(view_height,real32)*.5_real32-real((cell_y-1)*2+1,real32))/radius
     distance2=screen_x*screen_x+screen_y*screen_y
     if(distance2<=1.0_real32)then
       vector=[screen_x,screen_y,-sqrt(max(0.0_real32,1.0_real32-distance2))]
@@ -969,13 +1492,17 @@ contains
     integer,intent(in)::w,terminal_rows
     integer,intent(out)::used
     logical,intent(in)::full
-    integer::row,x,ty,by,pos,last_fg,last_bg,fg,bg
+    integer::row,x,pos,last_fg,last_bg,fg,bg
+    character(len=1)::glyph
     logical::changed,in_run
     pos=1; last_fg=-2; last_bg=-2; in_run=.false.
     do row=1,terminal_rows
-      ty=(row-1)*2+1; by=ty+1; in_run=.false.
+      if(hud_top==1.and.row==1)cycle
+      if(hud_bottom==1.and.row==terminal_rows)cycle
+      in_run=.false.
       do x=1,w
-        changed=full .or. pixels(x,ty)/=previous_pixels(x,ty) .or. pixels(x,by)/=previous_pixels(x,by)
+        call cell_style(x,row,fg,bg,glyph)
+        changed=full.or.fg/=previous_fg(x,row).or.bg/=previous_bg(x,row).or.glyph/=previous_glyph(x,row)
         if(.not.changed)then
           in_run=.false.; cycle
         end if
@@ -983,21 +1510,116 @@ contains
           call append_cursor(pos,row,x)
           last_fg=-2; last_bg=-2; in_run=.true.
         end if
-        fg=pixels(x,ty); bg=pixels(x,by)
-        if(fg==last_fg .and. bg==last_bg)then
-          call append_glyph(pos)
+        if(color_mode==0)then
+          call append_glyph(pos,glyph)
+        else if(fg==last_fg .and. bg==last_bg)then
+          call append_glyph(pos,glyph)
         else if(fg==last_fg)then
-          call append_bg(pos,bg); call append_glyph(pos); last_bg=bg
+          call append_bg(pos,bg); call append_glyph(pos,glyph); last_bg=bg
         else if(bg==last_bg)then
-          call append_fg(pos,fg); call append_glyph(pos); last_fg=fg
+          call append_fg(pos,fg); call append_glyph(pos,glyph); last_fg=fg
         else
-          call append_pair(pos,fg,bg); call append_glyph(pos); last_fg=fg; last_bg=bg
+          call append_pair(pos,fg,bg); call append_glyph(pos,glyph); last_fg=fg; last_bg=bg
         end if
+        previous_fg(x,row)=fg;previous_bg(x,row)=bg;previous_glyph(x,row)=glyph
       end do
     end do
-    previous_pixels=pixels
     used=pos-1
   end subroutine build_frame_delta
+
+  integer function terminal_color(packed) result(color)
+    integer,intent(in)::packed
+    integer,parameter::levels(0:5)=[0,95,135,175,215,255]
+    integer,parameter::palette(3,0:15)=reshape([ &
+      0,0,0, 170,0,0, 0,170,0, 170,85,0, 0,0,170, 170,0,170, 0,170,170, 170,170,170, &
+      85,85,85, 255,85,85, 85,255,85, 255,255,85, 85,85,255, 255,85,255, 85,255,255, 255,255,255],[3,16])
+    integer::rgb(3),cube(3),i,j,distance,best,gray,gray_distance
+    if(color_mode==16777216)then
+      color=packed;return
+    end if
+    color=0
+    if(color_mode==0)return
+    call unpack_rgb(packed,rgb)
+    if(color_mode==256)then
+      do j=1,3
+        best=huge(0);cube(j)=0
+        do i=0,5
+          distance=(rgb(j)-levels(i))**2
+          if(distance<best)then
+            best=distance;cube(j)=i
+          end if
+        end do
+      end do
+      distance=sum((rgb-levels(cube))**2)
+      gray=max(0,min(23,nint((real(sum(rgb),real32)/3.0_real32-8.0_real32)/10.0_real32)))
+      gray_distance=sum((rgb-(8+10*gray))**2)
+      color=16+36*cube(1)+6*cube(2)+cube(3)
+      if(gray_distance<distance)color=232+gray
+    else
+      best=huge(0)
+      do i=0,15
+        distance=sum((rgb-palette(:,i))**2)
+        if(distance<best)then
+          best=distance;color=i
+        end if
+      end do
+    end if
+  end function terminal_color
+
+  subroutine cell_style(x,row,fg,bg,glyph)
+    integer,intent(in)::x,row
+    integer,intent(out)::fg,bg
+    character(len=1),intent(out)::glyph
+    character(len=*),parameter::ramp=' .:-=+*#%@'
+    integer::ty,by,top(3),bottom(3),rgb(3),back(3),index_value
+    real(real32)::luminance
+    logical::top_hit,bottom_hit
+    ty=2*row-1;by=ty+1
+    if(unicode_mode==1)then
+      fg=terminal_color(pixels(x,ty));bg=terminal_color(pixels(x,by));glyph=achar(1);return
+    end if
+    top_hit=zbuffer(x,ty)<huge(1.0_real32)*.5_real32
+    bottom_hit=zbuffer(x,by)<huge(1.0_real32)*.5_real32
+    call unpack_rgb(background(x,ty),back)
+    bg=terminal_color(pack_rgb(back(1),back(2),back(3)))
+    fg=0;glyph=' '
+    if(.not.(top_hit.or.bottom_hit))return
+    call unpack_rgb(pixels(x,ty),top);call unpack_rgb(pixels(x,by),bottom)
+    if(top_hit.and.bottom_hit)then
+      rgb=(top+bottom)/2
+    else if(top_hit)then
+      rgb=top
+    else
+      rgb=bottom
+    end if
+    luminance=dot_product(real(rgb,real32),[.2126_real32,.7152_real32,.0722_real32])/255.0_real32
+    index_value=max(2,min(len(ramp),1+nint(luminance*real(len(ramp)-1,real32))))
+    glyph=ramp(index_value:index_value)
+    fg=terminal_color(pack_rgb(rgb(1),rgb(2),rgb(3)))
+  end subroutine cell_style
+
+  subroutine write_snapshot()
+    character(len=:),allocatable::line
+    character(len=160)::label
+    integer::row,x,fg,bg,n
+    character(len=1)::glyph
+    allocate(character(len=cols)::line)
+    do row=1,rows
+      line=repeat(' ',cols)
+      if(hud_top==1.and.row==1)then
+        label='Shape Lab | '//trim(mesh%name)//' | '//trim(theme%name)
+        n=min(cols,len_trim(label));line(:n)=label(:n)
+      else if(hud_bottom==1.and.row==rows)then
+        label=trim(mesh%name)//' | shapes --help for controls'
+        n=min(cols,len_trim(label));line(:n)=label(:n)
+      else
+        do x=1,cols
+          call cell_style(x,row,fg,bg,glyph);line(x:x)=glyph
+        end do
+      end if
+      write(output_unit,'(A)')trim(line)
+    end do
+  end subroutine write_snapshot
 
   subroutine append_cursor(pos,row,col)
     integer,intent(inout)::pos
@@ -1012,6 +1634,9 @@ contains
     integer,intent(inout)::pos
     integer,intent(in)::fg,bg
     integer::a(3),b(3)
+    if(color_mode/=16777216)then
+      call append_fg(pos,fg);call append_bg(pos,bg);return
+    end if
     call unpack_rgb(fg,a);call unpack_rgb(bg,b)
     frame_text(pos:pos)=ESC;pos=pos+1;frame_text(pos:pos+5)='[38;2;';pos=pos+6
     call append_rgb_triplet(pos,a)
@@ -1024,6 +1649,9 @@ contains
     integer,intent(inout)::pos
     integer,intent(in)::fg
     integer::a(3)
+    if(color_mode/=16777216)then
+      call append_indexed_color(pos,fg,.false.);return
+    end if
     call unpack_rgb(fg,a);frame_text(pos:pos)=ESC;pos=pos+1;frame_text(pos:pos+5)='[38;2;';pos=pos+6
     call append_rgb_triplet(pos,a);frame_text(pos:pos)='m';pos=pos+1
   end subroutine append_fg
@@ -1032,6 +1660,9 @@ contains
     integer,intent(inout)::pos
     integer,intent(in)::bg
     integer::a(3)
+    if(color_mode/=16777216)then
+      call append_indexed_color(pos,bg,.true.);return
+    end if
     call unpack_rgb(bg,a);frame_text(pos:pos)=ESC;pos=pos+1;frame_text(pos:pos+5)='[48;2;';pos=pos+6
     call append_rgb_triplet(pos,a);frame_text(pos:pos)='m';pos=pos+1
   end subroutine append_bg
@@ -1044,9 +1675,31 @@ contains
     frame_text(pos:pos+2)=decimal3(a(3));pos=pos+3
   end subroutine append_rgb_triplet
 
-  subroutine append_glyph(pos)
+  subroutine append_indexed_color(pos,color,is_background)
     integer,intent(inout)::pos
-    frame_text(pos:pos+2)=UPPER_HALF;pos=pos+3
+    integer,intent(in)::color
+    logical,intent(in)::is_background
+    character(len=24)::tmp
+    integer::code,n
+    if(color_mode==256)then
+      write(tmp,'(A,I0,A,I0,A)')ESC//'[',merge(48,38,is_background),';5;',color,'m'
+    else
+      code=30+mod(color,8)
+      if(color>=8)code=code+60
+      if(is_background)code=code+10
+      write(tmp,'(A,I0,A)')ESC//'[',code,'m'
+    end if
+    n=len_trim(tmp);frame_text(pos:pos+n-1)=tmp(:n);pos=pos+n
+  end subroutine append_indexed_color
+
+  subroutine append_glyph(pos,glyph)
+    integer,intent(inout)::pos
+    character(len=1),intent(in)::glyph
+    if(glyph==achar(1))then
+      frame_text(pos:pos+2)=UPPER_HALF;pos=pos+3
+    else
+      frame_text(pos:pos)=glyph;pos=pos+1
+    end if
   end subroutine append_glyph
 
   subroutine write_hud()
@@ -1059,29 +1712,38 @@ contains
     fg=theme%edge_rgb
     muted=nint(.62_real32*real(fg,real32)+.38_real32*real(bg,real32))
     motion=merge('AUTO        ','PAUSED      ',auto_rotate)
-    write(identity,'(A,A,A)')trim(mesh%name),'  /  ',trim(theme%name)
+    write(identity,'(I0,A,I0,4A)')shape_id,'/',max_shape,' ',trim(mesh%name),' / ',trim(theme%name)
     write(status,'(A,A,F3.1,A,F3.1)')trim(motion),'  ',auto_speed,'x  |  zoom ',camera_distance
 
-    call paint_hud_row(1,bg)
-    call write_hud_text(1,2,' SHAPE LAB ',fg,accent_bg,.true.)
-    identity_col=15
-    call write_hud_text(1,identity_col,trim(identity),fg,bg,.true.)
-    status_col=cols-len_trim(status)
-    if(status_col>identity_col+len_trim(identity)+2) &
-      call write_hud_text(1,status_col,trim(status),muted,bg,.false.)
-
-    if(cols>=117)then
-      help_text=' DRAG free rotate   WHEEL zoom   ARROWS / WASD rotate   1-5 shape   T theme'// &
-                '   SPACE pause   R reset   H hide   Q quit'
-    else if(cols>=78)then
-      help_text=' DRAG free rotate  WHEEL zoom  WASD rotate  1-5 shape  T theme  Q quit  H hide'
-    else if(cols>=47)then
-      help_text=' DRAG free  WHEEL zoom  1-5 shape  Q quit  H UI'
-    else
-      help_text=' DRAG free  WHEEL zoom  Q quit  H UI'
+    if(hud_top==1)then
+      call paint_hud_row(1,bg)
+      identity_col=2
+      if(cols>=60)then
+        call write_hud_text(1,2,' SHAPE LAB ',fg,accent_bg,.true.)
+        identity_col=15
+      end if
+      call write_hud_text(1,identity_col,trim(identity),fg,bg,.true.)
+      status_col=cols-len_trim(status)
+      if(status_col>identity_col+len_trim(identity)+2) &
+        call write_hud_text(1,status_col,trim(status),muted,bg,.false.)
     end if
-    call paint_hud_row(rows,bg)
-    call write_hud_text(rows,1,trim(help_text),muted,bg,.false.)
+
+    if(cols>=125)then
+      help_text=' DRAG / ARROWS / WASD rotate   WHEEL / ZX zoom   N/P shape   T theme'// &
+                '   SPACE pause   R reset   E edges   H hide   Q quit'
+    else if(cols>=78)then
+      help_text=' DRAG/WASD rotate  WHEEL/ZX zoom  N/P shape  T theme  SPACE pause  H UI  Q quit'
+    else if(cols>=47)then
+      help_text=' N/P shape  T theme  SPACE pause  H UI  Q quit'
+    else if(cols>=25)then
+      help_text=' Q quit  N/P shape  T theme'
+    else
+      help_text=' Q quit  N/P shape'
+    end if
+    if(hud_bottom==1)then
+      call paint_hud_row(rows,bg)
+      call write_hud_text(rows,1,trim(help_text),muted,bg,.false.)
+    end if
     write(output_unit,'(A)',advance='no')ESC//'[0m'
   end subroutine write_hud
 
@@ -1116,31 +1778,47 @@ contains
   subroutine set_hud_style(fg,bg,bold)
     integer,intent(in)::fg(3),bg(3)
     logical,intent(in)::bold
+    integer::a,b
     write(output_unit,'(A)',advance='no')ESC//'[0m'
     if(bold)write(output_unit,'(A)',advance='no')ESC//'[1m'
-    write(output_unit,'(A,I0,A,I0,A,I0,A,I0,A,I0,A,I0,A)',advance='no') &
-      ESC//'[38;2;',fg(1),';',fg(2),';',fg(3),';48;2;',bg(1),';',bg(2),';',bg(3),'m'
+    if(color_mode==16777216)then
+      write(output_unit,'(A,I0,A,I0,A,I0,A,I0,A,I0,A,I0,A)',advance='no') &
+        ESC//'[38;2;',fg(1),';',fg(2),';',fg(3),';48;2;',bg(1),';',bg(2),';',bg(3),'m'
+    else if(color_mode/=0)then
+      a=terminal_color(pack_rgb(fg(1),fg(2),fg(3)));b=terminal_color(pack_rgb(bg(1),bg(2),bg(3)))
+      if(color_mode==256)then
+        write(output_unit,'(A,I0,A,I0,A)',advance='no')ESC//'[38;5;',a,';48;5;',b,'m'
+      else
+        a=30+mod(a,8)+merge(60,0,a>=8);b=40+mod(b,8)+merge(60,0,b>=8)
+        write(output_unit,'(A,I0,A,I0,A)',advance='no')ESC//'[',a,';',b,'m'
+      end if
+    end if
   end subroutine set_hud_style
 
   subroutine poll_input(frame_dt)
     real(real32),intent(in)::frame_dt
-    integer(c_long)::nread
-    integer::i
+    integer(c_int)::nread
+    integer::i,batch
     character(len=1)::ch
-    do
-      nread=c_read(0_c_int,c_loc(input_bytes(1)),int(size(input_bytes),c_size_t))
-      if(nread<=0_c_long)exit
+    input_age=input_age+frame_dt
+    if(input_age>0.5_real32.and.input_state>=1.and.input_state<=4)input_state=0
+    do batch=1,8
+      nread=terminal_read(input_bytes,int(size(input_bytes),c_int))
+      if(nread<0)stop_requested=1
+      if(nread<=0)exit
       do i=1,int(nread)
         ch=achar(iachar(input_bytes(i)))
         call feed_input_char(ch,frame_dt)
       end do
-      if(nread<int(size(input_bytes),c_long))exit
+      if(nread<int(size(input_bytes),c_int))exit
     end do
   end subroutine poll_input
 
   subroutine feed_input_char(ch,frame_dt)
     character(len=1),intent(in)::ch
     real(real32),intent(in)::frame_dt
+    integer::code
+    code=iachar(ch);input_age=0.0_real32
     select case(input_state)
     case(0)
       if(iachar(ch)==27)then
@@ -1149,22 +1827,60 @@ contains
         call handle_key(ch)
       end if
     case(1)
-      if(ch=='[')then;input_state=2;else;input_state=0;end if
-    case(2)
-      if(ch=='<')then
+      mouse_len=0;mouse_text=''
+      select case(ch)
+      case('[');input_state=2
+      case('O');input_state=4
+      case(']','P','^','_');input_state=5
+      case default;input_state=0
+      end select
+    case(2,4)
+      if(ch=='<'.and.mouse_len==0)then
         input_state=3;mouse_len=0;mouse_text=''
-      else
+      else if(code>=64.and.code<=126)then
         call handle_arrow_key(ch)
         input_state=0
+        if(ch=='~'.and.trim(mouse_text)=='200')input_state=8
+      else if(code>=32.and.code<=63.and.mouse_len<len(mouse_text))then
+        mouse_len=mouse_len+1;mouse_text(mouse_len:mouse_len)=ch
+      else if(code==27)then
+        input_state=1
+      else
+        input_state=7
       end if
     case(3)
       if(ch=='M'.or.ch=='m')then
         call handle_mouse(mouse_text(1:max(1,mouse_len)),ch=='m',frame_dt)
         input_state=0;mouse_len=0
+      else if(mouse_len<len(mouse_text).and.((ch>='0'.and.ch<='9').or.ch==';'))then
+        mouse_len=mouse_len+1;mouse_text(mouse_len:mouse_len)=ch
+      else
+        input_state=7;mouse_len=0
+      end if
+    case(5)
+      if(code==7)input_state=0
+      if(code==27)input_state=6
+    case(6)
+      input_state=5
+      if(ch==achar(92))input_state=0
+    case(7)
+      if(code>=64.and.code<=126)input_state=0
+      if(code==27)input_state=1
+    case(8)
+      if(code==27)input_state=9
+    case(9)
+      input_state=8
+      if(ch=='[')then
+        input_state=10;mouse_len=0;mouse_text=''
+      end if
+    case(10)
+      if(code>=64.and.code<=126)then
+        input_state=8
+        if(ch=='~'.and.trim(mouse_text)=='201')input_state=0
       else if(mouse_len<len(mouse_text))then
         mouse_len=mouse_len+1;mouse_text(mouse_len:mouse_len)=ch
       else
-        input_state=0;mouse_len=0
+        input_state=8
       end if
     end select
   end subroutine feed_input_char
@@ -1173,8 +1889,8 @@ contains
     character(len=1),intent(in)::ch
     integer::v
     select case(ch)
-    case('q','Q')
-      stop_requested=1_c_int
+    case('q','Q',achar(3),achar(4))
+      stop_requested=1
     case(' ')
       auto_rotate=.not.auto_rotate; force_redraw=.true.
     case('t','T')
@@ -1184,7 +1900,9 @@ contains
       camera_distance=5.0_real32;angular_velocity=0.0_real32
       interaction_quiet=.8_real32;force_redraw=.true.
     case('h','H')
-      show_hud=.not.show_hud; force_redraw=.true.
+      show_hud=.not.show_hud;call update_layout();force_redraw=.true.
+    case('e','E')
+      draw_edges=.not.draw_edges;force_redraw=.true.
     case('[','-')
       auto_speed=max(.15_real32,auto_speed-.15_real32)
     case(']','+')
@@ -1205,10 +1923,15 @@ contains
       camera_distance=max(3.15_real32,camera_distance-.25_real32); interaction_quiet=.5_real32
     case('x','X')
       camera_distance=min(9.0_real32,camera_distance+.25_real32); interaction_quiet=.5_real32
-    case('1','2','3','4','5')
-      read(ch,*)v; shape_id=v; call load_shape(shape_id,mesh); interaction_quiet=.45_real32; force_redraw=.true.
-    case('n','N')
+    case('0','1','2','3','4','5','6','7','8','9')
+      read(ch,*)v
+      if(v==0)v=10
+      shape_id=v;call load_shape(shape_id,mesh);interaction_quiet=.45_real32;force_redraw=.true.
+    case('n','N',achar(9))
       shape_id=1+mod(shape_id,max_shape);call load_shape(shape_id,mesh)
+      interaction_quiet=.45_real32;force_redraw=.true.
+    case('p','P')
+      shape_id=1+modulo(shape_id-2,max_shape);call load_shape(shape_id,mesh)
       interaction_quiet=.45_real32;force_redraw=.true.
     end select
   end subroutine handle_key
@@ -1241,6 +1964,11 @@ contains
     do i=1,len_trim(tmp);if(tmp(i:i)==';')tmp(i:i)=' ';end do
     read(tmp,*,iostat=ios)b,x,y
     if(ios/=0)return
+    if(b<0.or.b>255)return
+    if(x<1.or.x>cols.or.y<1.or.y>rows)then
+      if(released)dragging=.false.
+      return
+    end if
     if(x>=1 .and. x<=cols .and. y>=1 .and. y<=rows)then
       mouse_present=.true.
     end if
@@ -1280,7 +2008,7 @@ contains
       mouse_x=x;mouse_y=y;return
     end if
     if(base==0)then
-      if(x>=1.and.x<=cols.and.y>1.and.y<rows)then
+      if(y>hud_top.and.y<=rows-hud_bottom)then
         dragging=.true.;mouse_x=x;mouse_y=y;angular_velocity=0.0_real32
         call trackball_vector(x,y,drag_vector)
         interaction_quiet=.85_real32
